@@ -18,6 +18,7 @@ use super::error::{Error, ErrorCode, Result};
 pub struct Deserializer<Iter: Iterator<Item=io::Result<u8>>> {
     rdr: Peekable<LineColIterator<Iter>>,
     str_buf: Vec<u8>,
+    eof_hit: bool,
 }
 
 macro_rules! try_or_invalid {
@@ -38,6 +39,7 @@ impl<Iter> Deserializer<Iter>
         Deserializer {
             rdr: LineColIterator::new(rdr).peekable(),
             str_buf: Vec::with_capacity(128),
+            eof_hit: false,
         }
     }
 
@@ -55,14 +57,14 @@ impl<Iter> Deserializer<Iter>
     }
 
     fn eof(&mut self) -> Result<bool> {
-        Ok(try!(self.peek()).is_none())
+        Ok(self.eof_hit)
     }
 
     fn peek(&mut self) -> Result<Option<u8>> {
         match self.rdr.peek() {
             Some(&Ok(ref c)) => Ok(Some(*c)),
             Some(&Err(ref e)) => Err(Error::Syntax(ErrorCode::EOFWhileParsingValue, 0, 0)),
-            None => {println!("hit");Ok(None)},
+            None => {self.eof_hit = true; Ok(None)},
         }
     }
 
