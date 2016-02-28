@@ -7,6 +7,7 @@ use std::i32;
 use std::io;
 use std::str;
 use std::marker::PhantomData;
+use std::iter::Peekable;
 
 use serde::de;
 use serde::iter::LineColIterator;
@@ -15,8 +16,7 @@ use super::error::{Error, ErrorCode, Result};
 
 /// A structure that deserializes JSON into Rust values.
 pub struct Deserializer<Iter: Iterator<Item=io::Result<u8>>> {
-    rdr: LineColIterator<Iter>,
-    ch: Option<u8>,
+    rdr: Peekable<LineColIterator<Iter>>,
     str_buf: Vec<u8>,
 }
 
@@ -36,8 +36,7 @@ impl<Iter> Deserializer<Iter>
     #[inline]
     pub fn new(rdr: Iter) -> Deserializer<Iter> {
         Deserializer {
-            rdr: LineColIterator::new(rdr),
-            ch: None,
+            rdr: LineColIterator::new(rdr).peekable(),
             str_buf: Vec::with_capacity(128),
         }
     }
@@ -60,57 +59,39 @@ impl<Iter> Deserializer<Iter>
     }
 
     fn peek(&mut self) -> Result<Option<u8>> {
-        match self.ch {
-            Some(ch) => Ok(Some(ch)),
-            None => {
-                match self.rdr.next() {
-                    Some(Err(err)) => Err(Error::Io(err)),
-                    Some(Ok(ch)) => {
-                        self.ch = Some(ch);
-                        Ok(self.ch)
-                    }
-                    None => Ok(None),
-                }
-            }
+        match self.rdr.peek() {
+            Some(&Ok(ref c)) => Ok(Some(*c)),
+            Some(&Err(ref e)) => Err(Error::Syntax(ErrorCode::EOFWhileParsingValue, 0, 0)),
+            None => {println!("hit");Ok(None)},
         }
     }
 
-    fn peek_or_null(&mut self) -> Result<u8> {
-        Ok(try!(self.peek()).unwrap_or(b'\x00'))
-    }
-
-    fn eat_char(&mut self) {
-        self.ch = None;
-    }
-
-    fn next_char(&mut self) -> Result<Option<u8>> {
-        match self.ch.take() {
-            Some(ch) => Ok(Some(ch)),
-            None => {
-                match self.rdr.next() {
-                    Some(Err(err)) => Err(Error::Io(err)),
-                    Some(Ok(ch)) => Ok(Some(ch)),
-                    None => Ok(None),
-                }
-            }
+    fn next(&mut self) -> Result<Option<u8>> {
+        match self.rdr.next() {
+            Some(Ok(c)) => Ok(Some(c)),
+            Some(Err(e)) => Err(Error::Io(e)),
+            None => Ok(None),
         }
-    }
-
-    fn next_char_or_null(&mut self) -> Result<u8> {
-        Ok(try!(self.next_char()).unwrap_or(b'\x00'))
     }
 
     fn error(&mut self, reason: ErrorCode) -> Error {
-        Error::Syntax(reason, self.rdr.line(), self.rdr.col())
+        Error::Syntax(reason, 1, 1)
+        // Error::Syntax(reason, self.rdr.line(), self.rdr.col())
     }
 
     fn parse_whitespace(&mut self) -> Result<()> {
         loop {
-            match try!(self.peek_or_null()) {
-                b' ' | b'\n' | b'\t' | b'\r' => {
-                    self.eat_char();
+            match try!(self.peek()) {
+                Some(b' ') |
+                Some(b'\n') |
+                Some(b'\t') |
+                Some(b'\r') =>
+                {
+                    self.next();
                 }
-                _ => { return Ok(()); }
+                _ => {
+                    return Ok(())
+                },
             }
         }
     }
@@ -120,50 +101,54 @@ impl<Iter> Deserializer<Iter>
     {
         try!(self.parse_whitespace());
 
-        if try!(self.eof()) {
-            return Err(self.error(ErrorCode::EOFWhileParsingValue));
-        }
+        let peek = match try!(self.peek()) {
+            Some(c) => c,
+            None => return Err(self.error(ErrorCode::EOFWhileParsingValue)),
+        };
 
-        let value = match try!(self.peek_or_null()) {
-            b'n' => {
-                self.eat_char();
+        let value = match try!(self.peek()) {
+            Some(b'n') => {
+                self.next();
                 try!(self.parse_ident(b"ull"));
                 visitor.visit_unit()
             }
-            b't' => {
-                self.eat_char();
+            Some(b't') => {
+                self.next();
                 try!(self.parse_ident(b"rue"));
                 visitor.visit_bool(true)
             }
-            b'f' => {
-                self.eat_char();
+            Some(b'f') => {
+                self.next();
                 try!(self.parse_ident(b"alse"));
                 visitor.visit_bool(false)
             }
-            b'-' => {
-                self.eat_char();
+            Some(b'-') => {
+                self.next();
                 self.parse_integer(false, visitor)
             }
-            b'0' ... b'9' => {
+            Some(b'0' ... b'9') => {
                 self.parse_integer(true, visitor)
             }
-            b'"' => {
-                self.eat_char();
+            Some(b'"') => {
+                self.next();
                 try!(self.parse_string());
                 let s = str::from_utf8(&self.str_buf).unwrap();
                 visitor.visit_str(s)
             }
-            b'[' => {
-                self.eat_char();
+            Some(b'[') => {
+                self.next();
                 visitor.visit_seq(SeqVisitor::new(self))
             }
-            b'{' => {
-                self.eat_char();
+            Some(b'{') => {
+                self.next();
                 visitor.visit_map(MapVisitor::new(self))
             }
-            _ => {
-                self.eat_char();
+            Some(_) => {
+                self.next();
                 Err(self.error(ErrorCode::ExpectedSomeValue))
+            },
+            None => {
+                Err(self.error(ErrorCode::EOFWhileParsingValue))
             }
         };
 
@@ -176,7 +161,7 @@ impl<Iter> Deserializer<Iter>
 
     fn parse_ident(&mut self, ident: &[u8]) -> Result<()> {
         for c in ident {
-            if Some(*c) != try!(self.next_char()) {
+            if Some(*c) != try!(self.next()) {
                 return Err(self.error(ErrorCode::ExpectedSomeIdent));
             }
         }
@@ -187,25 +172,28 @@ impl<Iter> Deserializer<Iter>
     fn parse_integer<V>(&mut self, pos: bool, visitor: V) -> Result<V::Value>
         where V: de::Visitor,
     {
-        match try!(self.next_char_or_null()) {
-            b'0' => {
+        match try!(self.next()) {
+            Some(b'0') => {
                 // There can be only one leading '0'.
-                match try!(self.peek_or_null()) {
-                    b'0' ... b'9' => {
+                match try!(self.peek()) {
+                    Some(b'0' ... b'9') => {
                         Err(self.error(ErrorCode::InvalidNumber))
                     }
-                    _ => {
+                    Some(_) => {
                         self.parse_number(pos, 0, visitor)
+                    },
+                    None => {
+                        return Err(self.error(ErrorCode::EOFWhileParsingValue))
                     }
                 }
             },
-            c @ b'1' ... b'9' => {
+            Some(c @ b'1' ... b'9') => {
                 let mut res: u64 = (c as u64) - ('0' as u64);
 
                 loop {
-                    match try!(self.peek_or_null()) {
-                        c @ b'0' ... b'9' => {
-                            self.eat_char();
+                    match try!(self.peek()) {
+                        Some(c @ b'0' ... b'9') => {
+                            self.next();
 
                             let digit = (c as u64) - ('0' as u64);
 
@@ -222,14 +210,20 @@ impl<Iter> Deserializer<Iter>
                                 }
                             }
                         }
-                        _ => {
+                        Some(_) => {
                             return self.parse_number(pos, res, visitor);
+                        },
+                        None => {
+                            return Err(self.error(ErrorCode::EOFWhileParsingValue))
                         }
                     }
                 }
             }
-            _ => {
+            Some(_) => {
                 Err(self.error(ErrorCode::InvalidNumber))
+            },
+            None => {
+                Err(self.error(ErrorCode::EOFWhileParsingValue))
             }
         }
     }
@@ -241,21 +235,21 @@ impl<Iter> Deserializer<Iter>
         where V: de::Visitor,
     {
         loop {
-            match try!(self.next_char_or_null()) {
-                c @ b'0' ... b'9' => {
+            match try!(self.next()) {
+                Some(c @ b'0' ... b'9') => {
                     let digit = (c as u64) - ('0' as u64);
 
                     res *= 10.0;
                     res += digit as f64;
                 }
-                _ => {
-                    match try!(self.peek_or_null()) {
-                        b'.' => {
+                Some(_) => {
+                    match try!(self.peek()) {
+                        Some(b'.') => {
                             return self.parse_decimal(pos, res, visitor);
                         }
-                        b'e' | b'E' => {
+                        Some(b'e') | Some(b'E') => {
                             return self.parse_exponent(pos, res, visitor);
-                        }
+                        },
                         _ => {
                             if !pos {
                                 res = -res;
@@ -264,6 +258,9 @@ impl<Iter> Deserializer<Iter>
                             return visitor.visit_f64(res);
                         }
                     }
+                }
+                None => {
+                    return Err(self.error(ErrorCode::EOFWhileParsingValue))
                 }
             }
         }
@@ -275,11 +272,11 @@ impl<Iter> Deserializer<Iter>
                        mut visitor: V) -> Result<V::Value>
         where V: de::Visitor,
     {
-        match try!(self.peek_or_null()) {
-            b'.' => {
+        match try!(self.peek()) {
+            Some(b'.') => {
                 self.parse_decimal(pos, res as f64, visitor)
             }
-            b'e' | b'E' => {
+            Some(b'e') | Some(b'E') => {
                 self.parse_exponent(pos, res as f64, visitor)
             }
             _ => {
@@ -305,22 +302,25 @@ impl<Iter> Deserializer<Iter>
                         mut visitor: V) -> Result<V::Value>
         where V: de::Visitor,
     {
-        self.eat_char();
+        self.next();
 
         let mut dec = 0.1;
 
         // Make sure a digit follows the decimal place.
-        match try!(self.next_char_or_null()) {
-            c @ b'0' ... b'9' => {
+        match try!(self.next()) {
+            Some(c @ b'0' ... b'9') => {
                 res += (((c as u64) - (b'0' as u64)) as f64) * dec;
             }
-             _ => { return Err(self.error(ErrorCode::InvalidNumber)); }
+            Some(_) => { return Err(self.error(ErrorCode::InvalidNumber)); }
+            None => {
+                return Err(self.error(ErrorCode::EOFWhileParsingValue))
+            }
         }
 
         loop {
-            match try!(self.peek_or_null()) {
-                c @ b'0' ... b'9' => {
-                    self.eat_char();
+            match try!(self.peek()) {
+                Some(c @ b'0' ... b'9') => {
+                    self.next();
 
                     dec /= 10.0;
                     res += (((c as u64) - (b'0' as u64)) as f64) * dec;
@@ -329,8 +329,8 @@ impl<Iter> Deserializer<Iter>
             }
         }
 
-        match try!(self.peek_or_null()) {
-            b'e' | b'E' => {
+        match try!(self.peek()) {
+            Some(b'e') | Some(b'E') => {
                 self.parse_exponent(pos, res, visitor)
             }
             _ => {
@@ -350,24 +350,24 @@ impl<Iter> Deserializer<Iter>
                          mut visitor: V) -> Result<V::Value>
         where V: de::Visitor,
     {
-        self.eat_char();
+        self.next();
 
-        let pos_exp = match try!(self.peek_or_null()) {
-            b'+' => { self.eat_char(); true }
-            b'-' => { self.eat_char(); false }
+        let pos_exp = match try!(self.peek()) {
+            Some(b'+') => { self.next(); true }
+            Some(b'-') => { self.next(); false }
             _ => { true }
         };
 
         // Make sure a digit follows the exponent place.
-        let mut exp = match try!(self.next_char_or_null()) {
-            c @ b'0' ... b'9' => { (c as u64) - (b'0' as u64) }
+        let mut exp = match try!(self.next()) {
+            Some(c @ b'0' ... b'9') => { (c as u64) - (b'0' as u64) }
             _ => { return Err(self.error(ErrorCode::InvalidNumber)); }
         };
 
         loop {
-            match try!(self.peek_or_null()) {
-                c @ b'0' ... b'9' => {
-                    self.eat_char();
+            match try!(self.peek()) {
+                Some(c @ b'0' ... b'9') => {
+                    self.next();
 
                     exp = try_or_invalid!(self, exp.checked_mul(10));
                     exp = try_or_invalid!(self, exp.checked_add((c as u64) - (b'0' as u64)));
@@ -399,14 +399,14 @@ impl<Iter> Deserializer<Iter>
         let mut i = 0;
         let mut n = 0u16;
         while i < 4 && !try!(self.eof()) {
-            n = match try!(self.next_char_or_null()) {
-                c @ b'0' ... b'9' => n * 16_u16 + ((c as u16) - (b'0' as u16)),
-                b'a' | b'A' => n * 16_u16 + 10_u16,
-                b'b' | b'B' => n * 16_u16 + 11_u16,
-                b'c' | b'C' => n * 16_u16 + 12_u16,
-                b'd' | b'D' => n * 16_u16 + 13_u16,
-                b'e' | b'E' => n * 16_u16 + 14_u16,
-                b'f' | b'F' => n * 16_u16 + 15_u16,
+            n = match try!(self.next()) {
+                Some(c @ b'0' ... b'9') => n * 16_u16 + ((c as u16) - (b'0' as u16)),
+                Some(b'a') | Some(b'A') => n * 16_u16 + 10_u16,
+                Some(b'b') | Some(b'B') => n * 16_u16 + 11_u16,
+                Some(b'c') | Some(b'C') => n * 16_u16 + 12_u16,
+                Some(b'd') | Some(b'D') => n * 16_u16 + 13_u16,
+                Some(b'e') | Some(b'E') => n * 16_u16 + 14_u16,
+                Some(b'f') | Some(b'F') => n * 16_u16 + 15_u16,
                 _ => { return Err(self.error(ErrorCode::InvalidEscape)); }
             };
 
@@ -425,7 +425,7 @@ impl<Iter> Deserializer<Iter>
         self.str_buf.clear();
 
         loop {
-            let ch = match try!(self.next_char()) {
+            let ch = match try!(self.next()) {
                 Some(ch) => ch,
                 None => { return Err(self.error(ErrorCode::EOFWhileParsingString)); }
             };
@@ -435,7 +435,7 @@ impl<Iter> Deserializer<Iter>
                     return Ok(());
                 }
                 b'\\' => {
-                    let ch = match try!(self.next_char()) {
+                    let ch = match try!(self.next()) {
                         Some(ch) => ch,
                         None => { return Err(self.error(ErrorCode::EOFWhileParsingString)); }
                     };
@@ -458,7 +458,7 @@ impl<Iter> Deserializer<Iter>
                                 // Non-BMP characters are encoded as a sequence of
                                 // two hex escapes, representing UTF-16 surrogates.
                                 n1 @ 0xD800 ... 0xDBFF => {
-                                    match (try!(self.next_char()), try!(self.next_char())) {
+                                    match (try!(self.next()), try!(self.next())) {
                                         (Some(b'\\'), Some(b'u')) => (),
                                         _ => {
                                             return Err(self.error(ErrorCode::UnexpectedEndOfHexEscape));
@@ -513,7 +513,7 @@ impl<Iter> Deserializer<Iter>
     fn parse_object_colon(&mut self) -> Result<()> {
         try!(self.parse_whitespace());
 
-        match try!(self.next_char()) {
+        match try!(self.next()) {
             Some(b':') => Ok(()),
             Some(_) => Err(self.error(ErrorCode::ExpectedColon)),
             None => Err(self.error(ErrorCode::EOFWhileParsingObject)),
@@ -540,9 +540,9 @@ impl<Iter> de::Deserializer for Deserializer<Iter>
     {
         try!(self.parse_whitespace());
 
-        match try!(self.peek_or_null()) {
-            b'n' => {
-                self.eat_char();
+        match try!(self.peek()) {
+            Some(b'n') => {
+                self.next();
                 try!(self.parse_ident(b"ull"));
                 visitor.visit_none()
             }
@@ -573,8 +573,8 @@ impl<Iter> de::Deserializer for Deserializer<Iter>
     {
         try!(self.parse_whitespace());
 
-        match try!(self.next_char_or_null()) {
-            b'{' => {
+        match try!(self.next()) {
+            Some(b'{') => {
                 try!(self.parse_whitespace());
 
                 let value = {
@@ -583,8 +583,8 @@ impl<Iter> de::Deserializer for Deserializer<Iter>
 
                 try!(self.parse_whitespace());
 
-                match try!(self.next_char_or_null()) {
-                    b'}' => {
+                match try!(self.next()) {
+                    Some(b'}') => {
                         Ok(value)
                     }
                     _ => {
@@ -628,7 +628,7 @@ impl<'a, Iter> de::SeqVisitor for SeqVisitor<'a, Iter>
                 return Ok(None);
             }
             Some(b',') if !self.first => {
-                self.de.eat_char();
+                self.de.next();
             }
             Some(_) => {
                 if self.first {
@@ -649,7 +649,7 @@ impl<'a, Iter> de::SeqVisitor for SeqVisitor<'a, Iter>
     fn end(&mut self) -> Result<()> {
         try!(self.de.parse_whitespace());
 
-        match try!(self.de.next_char()) {
+        match try!(self.de.next()) {
             Some(b']') => { Ok(()) }
             Some(_) => {
                 Err(self.de.error(ErrorCode::TrailingCharacters))
@@ -690,7 +690,7 @@ impl<'a, Iter> de::MapVisitor for MapVisitor<'a, Iter>
                 return Ok(None);
             }
             Some(b',') if !self.first => {
-                self.de.eat_char();
+                self.de.next();
                 try!(self.de.parse_whitespace());
             }
             Some(_) => {
@@ -729,7 +729,7 @@ impl<'a, Iter> de::MapVisitor for MapVisitor<'a, Iter>
     fn end(&mut self) -> Result<()> {
         try!(self.de.parse_whitespace());
 
-        match try!(self.de.next_char()) {
+        match try!(self.de.next()) {
             Some(b'}') => { Ok(()) }
             Some(_) => {
                 Err(self.de.error(ErrorCode::TrailingCharacters))
