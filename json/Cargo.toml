@@ -13,6 +13,6 @@ keywords = ["json", "serde", "serialization"]
 nightly-testing = ["clippy"]
 
 [dependencies]
-serde = "^0.7.0"
+serde = { git = "https://github.com/nixpulvis.json.git" }
 num = { version = "~0.1.27", default-features = false }
 clippy = { version = "^0.*", optional = true }
